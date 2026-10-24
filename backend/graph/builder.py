@@ -109,21 +109,48 @@ graph = build_graph()
 
 
 
-#       [ START ]
-#          │
-#          ▼
-#       [ chatbot ] ◄─────────────┐
-#          │                      │
-#     ┌────┴────┐                 │
-#     │ (check) │                 │
-#     ├─────────┤                 │
-#     │         │                 │
-# tool call?  final answer?      │
-#     │         │                 │
-#     ▼         ▼                 │
-# [ tools ]  [ memory_extractor ]│
-#     │         │                 │
-#     └─────────┘                 │
-#               │
-#               ▼
-#            [ END ]
+# ==============================================================================
+#                 MULTI-AGENT WORKFLOW ARCHITECTURE (Saarthi AI)
+# ==============================================================================
+#
+#                              [ USER REQUEST ]
+#                                     │
+#                                     ▼
+#                                 [ START ]
+#                                     │
+#                                     ▼
+#                          ┌─────────────────────┐
+#                          │   1. PLANNER NODE   │ ◄── (Architect: 2-4 Step Plan)
+#                          └──────────┬──────────┘
+#                                     │
+#                                     ▼
+#                          ┌─────────────────────┐
+#                     ┌──► │    2. CODER NODE    │ ◄── (Software Engineer)
+#                     │    └──────────┬──────────┘
+#                     │               │
+#                     │         Tool call needed?
+#                     │        ┌──────┴──────┐
+#                     │      (Yes)          (No)
+#                     │        │              │
+#                     │        ▼              │
+#   Tool results /    │   ┌─────────┐         │
+#   User Approvals ───┼── │  TOOLS  │         │
+#                     │   └─────────┘         │
+#                     │   (HITL Pause/Resume) │
+#                     │                       ▼
+#                     │            ┌─────────────────────┐
+#                     │            │  4. REVIEWER NODE   │ ◄── (QA Tester: Verifies Execution)
+#                     │            └──────────┬──────────┘
+#                     │                       │
+#               Bug found? /             All steps
+#             More plan steps?           approved?
+#                     │                       │
+#                     └───────────────────────┤
+#                                             ▼
+#                                  ┌─────────────────────┐
+#                                  │ 5. MEMORY EXTRACTOR │ ◄── (Auto-extracts facts to PostgreSQL)
+#                                  └──────────┬──────────┘
+#                                             │
+#                                             ▼
+#                                          [ END ]
+# ==============================================================================

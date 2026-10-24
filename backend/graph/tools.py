@@ -25,6 +25,93 @@ USER_NAMESPACE = ("user", "1")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def get_dynamic_user_folder(folder_name: str) -> str:
+    """
+    Dynamically resolve standard user folders (Downloads, Documents, Desktop)
+    via Windows Registry Shell Folders. Automatically supports OneDrive locations,
+    custom drive mappings (e.g. D:\Downloads), and falls back cross-platform.
+    """
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            )
+            registry_names = {
+                "downloads": "{374DE290-123F-4565-9164-39C4925E467B}",
+                "documents": "Personal",
+                "desktop": "Desktop"
+            }
+            reg_key = registry_names.get(folder_name.lower())
+            if reg_key:
+                raw_path, _ = winreg.QueryValueEx(key, reg_key)
+                resolved = os.path.expandvars(raw_path)
+                if os.path.exists(resolved):
+                    return os.path.normpath(resolved)
+        except Exception:
+            pass
+
+    return os.path.normpath(os.path.join(os.path.expanduser("~"), folder_name.capitalize()))
+
+
+def resolve_system_path(file_path: str) -> str:
+    """
+    Intelligently resolve paths to prevent permission errors and model hallucinations:
+    1. Strips quotes and whitespace.
+    2. Expands ~ to the user profile (e.g. C:/Users/Admin).
+    3. Handles cases where the model hallucinated C:/Users/<chat_name>/Downloads
+       instead of the actual Windows account (e.g. C:/Users/Admin/Downloads).
+    4. Handles relative 'downloads/' or 'download/' -> Dynamic OS Downloads Folder.
+    5. Handles relative 'documents/' or 'document/' -> Dynamic OS Documents Folder.
+    6. Handles relative 'desktop/' -> Dynamic OS Desktop Folder.
+    7. Relative paths default to PROJECT_ROOT.
+    """
+    if not file_path:
+        return PROJECT_ROOT
+
+    clean_path = str(file_path).strip().strip("'\"")
+    expanded = os.path.expanduser(clean_path)
+
+    downloads_dir = get_dynamic_user_folder("downloads")
+    desktop_dir = get_dynamic_user_folder("desktop")
+    documents_dir = get_dynamic_user_folder("documents")
+
+    # If model produced C:/Users/<other_name>/Downloads/...
+    m = re.match(r'^[a-zA-Z]:[/\\]Users[/\\]([^/\\]+)[/\\](Downloads|Desktop|Documents)(.*)$', expanded, re.IGNORECASE)
+    if m:
+        folder_type = m.group(2).lower()
+        subpath = m.group(3).lstrip("/\\")
+        base_folder = (
+            downloads_dir if folder_type == "downloads"
+            else desktop_dir if folder_type == "desktop"
+            else documents_dir
+        )
+        parent = os.path.dirname(expanded)
+        if not os.path.exists(parent):
+            return os.path.normpath(os.path.join(base_folder, subpath))
+
+    # Match relative 'downloads/...' or 'download/...'
+    if re.match(r'^(?:downloads|download)[/\\]?', clean_path, re.IGNORECASE):
+        subpath = re.sub(r'^(?:downloads|download)[/\\]?', '', clean_path, flags=re.IGNORECASE).lstrip("/\\")
+        return os.path.normpath(os.path.join(downloads_dir, subpath))
+
+    # Match relative 'documents/...' or 'document/...' or 'documnt/...'
+    if re.match(r'^(?:documents|document|documnt)[/\\]?', clean_path, re.IGNORECASE):
+        subpath = re.sub(r'^(?:documents|document|documnt)[/\\]?', '', clean_path, flags=re.IGNORECASE).lstrip("/\\")
+        return os.path.normpath(os.path.join(documents_dir, subpath))
+
+    # Match relative 'desktop/...'
+    if re.match(r'^desktop[/\\]?', clean_path, re.IGNORECASE):
+        subpath = re.sub(r'^desktop[/\\]?', '', clean_path, flags=re.IGNORECASE).lstrip("/\\")
+        return os.path.normpath(os.path.join(desktop_dir, subpath))
+
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    else:
+        return os.path.normpath(os.path.join(PROJECT_ROOT, expanded))
+
+
 @tool
 def search_codebase(query: str) -> str:
     """
@@ -61,11 +148,7 @@ def read_file(file_path: str) -> str:
     Args:
         file_path: Absolute path (e.g. 'C:/Users/Admin/Downloads/3.py') or relative path from project root (e.g. 'backend/main.py').
     """
-    # Resolve path
-    if os.path.isabs(file_path):
-        target_path = os.path.normpath(file_path)
-    else:
-        target_path = os.path.normpath(os.path.join(PROJECT_ROOT, file_path))
+    target_path = resolve_system_path(file_path)
 
     if not os.path.exists(target_path):
         return f"Error: File '{file_path}' does not exist at '{target_path}'."
@@ -93,10 +176,7 @@ def list_directory(directory_path: str = ".") -> str:
     Args:
         directory_path: Absolute directory path or relative path from project root ('.' for project root).
     """
-    if os.path.isabs(directory_path):
-        target_path = os.path.normpath(directory_path)
-    else:
-        target_path = os.path.normpath(os.path.join(PROJECT_ROOT, directory_path))
+    target_path = resolve_system_path(directory_path)
 
     if not os.path.exists(target_path):
         return f"Error: Directory '{directory_path}' does not exist at '{target_path}'."
@@ -127,10 +207,22 @@ def execute_python_code(code: str) -> str:
     """
     Execute a snippet of Python code and return stdout/stderr output.
     Use this to run calculations, test code logic, or analyze data.
+    DO NOT use to save or write files to disk. You MUST use the `write_file` tool to create or save files so the user receives the required approval card.
     
     Args:
         code: Python source code string to execute.
     """
+    # Guard against models using execute_python_code to bypass write_file approval
+    if re.search(r'open\s*\([^)]*["\'][wa\+]["\'\)]', code) or (re.search(r'\.write\s*\(', code) and "open(" in code):
+        return (
+            "[FILE WRITE BLOCKED]: Direct disk writing inside 'execute_python_code' is not allowed. "
+            "You MUST invoke the 'write_file' tool to write or create files on disk so the user can review and approve it."
+        )
+
+    # Clean up unescaped string literals like \\n or \\t if present
+    if "\\n" in code and "\n" not in code:
+        code = code.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
 
@@ -154,15 +246,35 @@ def execute_python_code(code: str) -> str:
             return "Code executed successfully with no output."
         
         return "\n".join(output)
-    except Exception:
-        err_msg = traceback.format_exc()
+    except Exception as exc:
+        # Filter out internal backend stack frames (e.g. backend/graph/tools.py) so model doesn't try to edit system files
+        raw_tb = traceback.format_exc()
+        clean_lines = [
+            line for line in raw_tb.splitlines() 
+            if "backend\\graph\\tools.py" not in line and "backend/graph/tools.py" not in line
+        ]
+        err_msg = "\n".join(clean_lines)
+
+        # Detect missing Python package / dependency error
+        pkg_match = re.search(r"No module named ['\"]([^'\"]+)['\"]", raw_tb)
+        if isinstance(exc, (ModuleNotFoundError, ImportError)) or pkg_match:
+            missing_pkg = pkg_match.group(1).split('.')[0] if pkg_match else "package"
+            return (
+                f"[MISSING PACKAGE DETECTED]:\n"
+                f"Execution failed because the required Python package '{missing_pkg}' is not installed.\n"
+                f"Traceback:\n{err_msg}\n\n"
+                f"ACTION REQUIRED:\n"
+                f"1. You MUST IMMEDIATELY call `run_terminal_command(command='pip install {missing_pkg}')`.\n"
+                f"2. This will automatically present the user with the Human-in-the-Loop Approval Card to approve installing '{missing_pkg}'.\n"
+                f"3. Do NOT downgrade or cancel the user's request. Ask the user for approval via `run_terminal_command`."
+            )
+
         return (
             f"[PYTHON EXECUTION FAILED]\n"
             f"Execution Error Traceback:\n{err_msg}\n"
-            f"🚨 AUTONOMOUS SELF-DEBUGGING TRIGGER:\n"
-            f"The Python execution failed. Analyze the traceback above to identify the root cause. "
-            f"If it was code you wrote or a file you modified, inspect and fix the bug, then re-execute "
-            f"to verify it passes before presenting your final answer."
+            f"[AUTONOMOUS SELF-DEBUGGING TRIGGER]:\n"
+            f"The Python execution failed. Analyze the traceback above to identify the root cause in the executed snippet. "
+            f"Do NOT attempt to edit backend system files. Fix the script or algorithm code and re-test."
         )
 
 
@@ -176,11 +288,13 @@ def write_file(file_path: str, content: str) -> str:
         file_path: Absolute path or relative path from project root.
         content: Complete code or text content to write into the file.
     """
+    target_path = resolve_system_path(file_path)
+
     # 🛑 1. Request Human Approval before writing to disk
     decision = interrupt({
         "action": "write_file",
-        "file_path": file_path,
-        "preview": content[:250] + ("..." if len(content) > 250 else ""),
+        "file_path": target_path,
+        "preview": content[:3000] + ("..." if len(content) > 3000 else ""),
         "char_count": len(content)
     })
 
@@ -191,14 +305,9 @@ def write_file(file_path: str, content: str) -> str:
     if not is_approved:
         if user_feedback:
             return f"Action REJECTED by user with instructions: '{user_feedback}'. Please adjust your code or approach accordingly."
-        return f"Action REJECTED by user: Permission to write to '{file_path}' was denied."
+        return f"Action REJECTED by user: Permission to write to '{target_path}' was denied."
 
     # 3. If approved, proceed with writing file
-    if os.path.isabs(file_path):
-        target_path = os.path.normpath(file_path)
-    else:
-        target_path = os.path.normpath(os.path.join(PROJECT_ROOT, file_path))
-
     try:
         parent_dir = os.path.dirname(target_path)
         if parent_dir and not os.path.exists(parent_dir):
@@ -212,7 +321,7 @@ def write_file(file_path: str, content: str) -> str:
             msg += f" (Note from user: '{user_feedback}')"
         return msg
     except Exception as e:
-        return f"Error writing file '{file_path}': {str(e)}"
+        return f"Error writing file '{target_path}': {str(e)}"
 
 
 @tool
@@ -227,10 +336,7 @@ def edit_file(file_path: str, target_content: str, replacement_content: str) -> 
         replacement_content: The new replacement code or text block to insert in its place.
     """
     # 1. Resolve path
-    if os.path.isabs(file_path):
-        target_path = os.path.normpath(file_path)
-    else:
-        target_path = os.path.normpath(os.path.join(PROJECT_ROOT, file_path))
+    target_path = resolve_system_path(file_path)
 
     if not os.path.exists(target_path):
         return f"Error: File '{file_path}' does not exist at '{target_path}'. If creating a new file, use 'write_file' instead."
@@ -269,19 +375,19 @@ def edit_file(file_path: str, target_content: str, replacement_content: str) -> 
     diff_lines = list(difflib.unified_diff(
         original.splitlines(),
         modified.splitlines(),
-        fromfile=f"a/{os.path.basename(file_path)}",
-        tofile=f"b/{os.path.basename(file_path)}",
+        fromfile=f"a/{os.path.basename(target_path)}",
+        tofile=f"b/{os.path.basename(target_path)}",
         lineterm=""
     ))
-    diff_preview = "\n".join(diff_lines[:60])
+    diff_preview = "\n".join(diff_lines[:250])
 
     # 🛑 6. Request Human Approval with Diff Preview
     decision = interrupt({
         "action": "edit_file",
-        "file_path": file_path,
+        "file_path": target_path,
         "diff": diff_preview,
-        "old_lines": target_content[:300] + ("..." if len(target_content) > 300 else ""),
-        "new_lines": replacement_content[:300] + ("..." if len(replacement_content) > 300 else ""),
+        "old_lines": target_content[:3000] + ("..." if len(target_content) > 3000 else ""),
+        "new_lines": replacement_content[:3000] + ("..." if len(replacement_content) > 3000 else ""),
         "char_diff": len(replacement_content) - len(target_content)
     })
 
@@ -292,7 +398,7 @@ def edit_file(file_path: str, target_content: str, replacement_content: str) -> 
     if not is_approved:
         if user_feedback:
             return f"Edit REJECTED by user with instructions: '{user_feedback}'. Adjust your patch accordingly."
-        return f"Edit REJECTED by user: Permission to modify '{file_path}' was denied."
+        return f"Edit REJECTED by user: Permission to modify '{target_path}' was denied."
 
     # 8. Apply patch
     try:

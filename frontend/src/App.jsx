@@ -14,7 +14,9 @@ import {
 } from "./services/api";
 
 export default function App() {
-  const [activeThreadId, setActiveThreadId] = useState("default");
+  const [activeThreadId, setActiveThreadId] = useState(() => {
+    return localStorage.getItem("saarthi-active-thread") || "default";
+  });
   const [threads, setThreads] = useState(["default"]);
   const [threadTitles, setThreadTitles] = useState(() => {
     try {
@@ -23,6 +25,13 @@ export default function App() {
       return {};
     }
   });
+
+  // Sync active thread ID to localStorage
+  useEffect(() => {
+    if (activeThreadId) {
+      localStorage.setItem("saarthi-active-thread", activeThreadId);
+    }
+  }, [activeThreadId]);
   // Per-thread state storage (ChatGPT style)
   const [threadMessages, setThreadMessages] = useState({});
   const [streamingContentByThread, setStreamingContentByThread] = useState({});
@@ -100,7 +109,12 @@ export default function App() {
       const saved = await fetchSavedThreads();
       if (saved && saved.length > 0) {
         setThreads(saved);
-        setActiveThreadId(saved[0]);
+        const storedActive = localStorage.getItem("saarthi-active-thread");
+        if (storedActive && saved.includes(storedActive)) {
+          setActiveThreadId(storedActive);
+        } else {
+          setActiveThreadId(saved[0]);
+        }
 
         // Auto-assign titles to any old threads missing one
         try {
@@ -133,9 +147,13 @@ export default function App() {
   }, [checkHealth, loadMemories, updateThreadTitle]);
 
   const threadMessagesRef = useRef(threadMessages);
+  const thoughtsRef = useRef(thoughtsByThread);
   useEffect(() => {
     threadMessagesRef.current = threadMessages;
   }, [threadMessages]);
+  useEffect(() => {
+    thoughtsRef.current = thoughtsByThread;
+  }, [thoughtsByThread]);
 
   // Load history whenever activeThreadId changes (if not already loaded in memory)
   useEffect(() => {
@@ -264,24 +282,31 @@ export default function App() {
         setIsStreamingByThread((prev) => ({ ...prev, [currentTid]: false }));
         delete abortControllersRef.current[currentTid];
 
-        // Capture thoughts collected during this generation
-        setThoughtsByThread((currentMap) => {
-          const finalThoughts = currentMap[currentTid] || [];
-          setThreadMessages((prev) => ({
+        const finalThoughts = thoughtsRef.current[currentTid] || [];
+        const textToSave = finalText || "No response received.";
+
+        setThreadMessages((prev) => {
+          const list = prev[currentTid] || [];
+          const last = list[list.length - 1];
+          // Prevent duplicate messages if already appended
+          if (last && last.sender === "assistant" && last.content === textToSave) {
+            return prev;
+          }
+          return {
             ...prev,
             [currentTid]: [
-              ...(prev[currentTid] || []),
+              ...list,
               {
                 id: `ai_${Date.now()}`,
                 sender: "assistant",
-                content: finalText || "No response received.",
+                content: textToSave,
                 thoughts: finalThoughts,
               },
             ],
-          }));
-          return { ...currentMap, [currentTid]: [] };
+          };
         });
 
+        setThoughtsByThread((prev) => ({ ...prev, [currentTid]: [] }));
         setStreamingContentByThread((prev) => ({ ...prev, [currentTid]: "" }));
         checkHealth();
         // Reload memories after response (auto-memory may have saved new facts)
@@ -352,23 +377,33 @@ export default function App() {
         setIsStreamingByThread((prev) => ({ ...prev, [currentTid]: false }));
         delete abortControllersRef.current[currentTid];
 
-        setThoughtsByThread((currentMap) => {
-          const finalThoughts = currentMap[currentTid] || [];
-          setThreadMessages((prev) => ({
+        const finalThoughts = thoughtsRef.current[currentTid] || [];
+        const fallbackText = decision.approved
+          ? "Action was approved and completed."
+          : "Action was rejected by user.";
+        const textToSave = finalText || fallbackText;
+
+        setThreadMessages((prev) => {
+          const list = prev[currentTid] || [];
+          const last = list[list.length - 1];
+          if (last && last.sender === "assistant" && last.content === textToSave) {
+            return prev;
+          }
+          return {
             ...prev,
             [currentTid]: [
-              ...(prev[currentTid] || []),
+              ...list,
               {
                 id: `ai_${Date.now()}`,
                 sender: "assistant",
-                content: finalText || (decision.approved ? "Action was approved and completed." : "Action was rejected by user."),
+                content: textToSave,
                 thoughts: finalThoughts,
               },
             ],
-          }));
-          return { ...currentMap, [currentTid]: [] };
+          };
         });
 
+        setThoughtsByThread((prev) => ({ ...prev, [currentTid]: [] }));
         setStreamingContentByThread((prev) => ({ ...prev, [currentTid]: "" }));
         checkHealth();
         setTimeout(() => loadMemories(), 3000);

@@ -25,7 +25,27 @@ def clean_response_text(text: str) -> str:
     """
     if not isinstance(text, str):
         return str(text)
-    
+
+    # 1. If entire text is wrapped in a JSON block like {"response": "..."}
+    trimmed = text.strip()
+    json_candidate = None
+    if trimmed.startswith("```"):
+        m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', trimmed)
+        if m:
+            json_candidate = m.group(1).strip()
+    elif trimmed.startswith("{") and trimmed.endswith("}"):
+        json_candidate = trimmed
+
+    if json_candidate:
+        try:
+            parsed = json.loads(json_candidate)
+            if isinstance(parsed, dict):
+                for k in ["response", "message", "reply", "answer", "content"]:
+                    if k in parsed and isinstance(parsed[k], str) and parsed[k].strip():
+                        return parsed[k].strip()
+        except Exception:
+            pass
+
     # Strip <tool_response>...</tool_response> blocks
     cleaned = re.sub(r'<tool_response>[\s\S]*?</tool_response>', '', text, flags=re.IGNORECASE).strip()
     # Strip <tool_call>...</tool_call> blocks
@@ -289,7 +309,8 @@ def chat_history(thread_id: str):
 @router.get("/chat/threads")
 def get_threads():
     """
-    Fetch all saved conversation thread IDs from checkpoints table in PostgreSQL.
+    Fetch all saved conversation thread IDs from checkpoints table in PostgreSQL,
+    ordered by their most recent activity (latest checkpoint first).
     """
     import psycopg
     from psycopg.rows import dict_row
@@ -297,7 +318,13 @@ def get_threads():
     try:
         with psycopg.connect(DB_URI, row_factory=dict_row) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id DESC")
+                cur.execute("""
+                    SELECT thread_id, MAX(checkpoint_id) as last_cp 
+                    FROM checkpoints 
+                    WHERE thread_id NOT LIKE 'test_%' AND thread_id NOT LIKE 'verification_%'
+                    GROUP BY thread_id 
+                    ORDER BY last_cp DESC;
+                """)
                 rows = cur.fetchall()
                 threads = [r["thread_id"] for r in rows if r.get("thread_id")]
                 return {"threads": threads if threads else ["default"]}
